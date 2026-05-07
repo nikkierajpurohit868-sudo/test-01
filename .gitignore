@@ -1,0 +1,23 @@
+node_modules
+dist
+dist-ssr
+.vite
+.cache
+.DS_Store
+*.local
+*.log
+.env
+.env.*
+!.env.example
+coverage
+.pnpm-store
+
+# tsc 增量构建产物
+*.tsbuildinfo
+# tsc -b 误产出的 emit 文件（src 下不应有 .js / .d.ts）
+apps/web/src/**/*.js
+apps/web/src/**/*.d.ts
+!apps/web/src/types/*.d.ts
+packages/schema/src/**/*.js
+packages/schema/src/**/*.d.ts
+packages/schema/dist/
