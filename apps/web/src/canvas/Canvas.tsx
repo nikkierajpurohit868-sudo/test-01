@@ -10,8 +10,8 @@ import { Stage, Layer, Rect, Line, Text, Group, Circle, Transformer } from "reac
 import type Konva from "konva";
 import { useProjectStore } from "@/store/projectStore";
 import { findTemplate } from "@/lib/equipmentLibrary";
-import type { CanvasItem } from "@ilp/schema";
-import { DxfBackgroundLayer } from "./DxfBackgroundLayer";
+import type { CanvasItem, CustomBlock } from "@ilp/schema";
+import { DxfBackgroundLayer, EntityNode } from "./DxfBackgroundLayer";
 
 const MIN_SCALE = 0.005;
 const MAX_SCALE = 1;
@@ -29,6 +29,8 @@ export function Canvas() {
   const selectItem = useProjectStore((s) => s.selectItem);
   const updateCanvasItem = useProjectStore((s) => s.updateCanvasItem);
   const addEquipmentFromTemplate = useProjectStore((s) => s.addEquipmentFromTemplate);
+  const customBlocks = useProjectStore((s) => s.project.customBlocks);
+  const addCanvasItemFromCustomBlock = useProjectStore((s) => s.addCanvasItemFromCustomBlock);
   const deleteCanvasItem = useProjectStore((s) => s.deleteCanvasItem);
   const snapStep = useProjectStore((s) => s.snapStep);
   const snap = (v: number) => (snapStep > 0 ? Math.round(v / snapStep) * snapStep : v);
@@ -89,19 +91,31 @@ export function Canvas() {
     }
   };
 
-  // HTML5 DnD: 设备库 → 画布
+  // HTML5 DnD: 设备库 / 自定义图块 → 画布
   const onDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
-    const modelId = e.dataTransfer.getData("application/x-ilp-equipment");
-    if (!modelId) return;
-    const tpl = findTemplate(modelId);
-    if (!tpl) return;
     const rect = containerRef.current!.getBoundingClientRect();
     const px = e.clientX - rect.left;
     const py = e.clientY - rect.top;
-    const mmX = snap((px - view.x) / view.scale - tpl.footprint.w / 2);
-    const mmY = snap((py - view.y) / view.scale - tpl.footprint.h / 2);
-    addEquipmentFromTemplate(tpl, mmX, mmY);
+
+    const modelId = e.dataTransfer.getData("application/x-ilp-equipment");
+    if (modelId) {
+      const tpl = findTemplate(modelId);
+      if (!tpl) return;
+      const mmX = snap((px - view.x) / view.scale - tpl.footprint.w / 2);
+      const mmY = snap((py - view.y) / view.scale - tpl.footprint.h / 2);
+      addEquipmentFromTemplate(tpl, mmX, mmY);
+      return;
+    }
+
+    const blockId = e.dataTransfer.getData("application/x-ilp-customblock");
+    if (blockId) {
+      const block = customBlocks.find((b) => b.id === blockId);
+      if (!block) return;
+      const mmX = snap((px - view.x) / view.scale - block.footprint.w / 2);
+      const mmY = snap((py - view.y) / view.scale - block.footprint.h / 2);
+      addCanvasItemFromCustomBlock(block, mmX, mmY);
+    }
   };
 
   // 监听 fit-view 事件（DXF 导入后自动调用）
@@ -156,6 +170,12 @@ export function Canvas() {
             <CanvasItemNode
               key={it.id}
               item={it}
+              customBlock={
+                it.kind === "customBlock"
+                  ? customBlocks.find((b) => b.id === it.refId)
+                  : undefined
+              }
+              viewScale={view.scale}
               registerRef={(node) => {
                 if (node) itemNodeRefs.current.set(it.id, node);
                 else itemNodeRefs.current.delete(it.id);
@@ -251,6 +271,8 @@ function fitToContent(
 
 function CanvasItemNode(props: {
   item: CanvasItem;
+  customBlock?: CustomBlock;
+  viewScale: number;
   eqColor: string;
   reach?: number;
   selected: boolean;
@@ -259,8 +281,21 @@ function CanvasItemNode(props: {
   onTransformEnd: (x: number, y: number, rotation: number) => void;
   registerRef: (node: Konva.Group | null) => void;
 }) {
-  const { item, eqColor, reach, selected, onSelect, onDragEnd, onTransformEnd, registerRef } =
-    props;
+  const {
+    item,
+    customBlock,
+    viewScale,
+    eqColor,
+    reach,
+    selected,
+    onSelect,
+    onDragEnd,
+    onTransformEnd,
+    registerRef,
+  } = props;
+
+  const isCustomBlock = item.kind === "customBlock" && customBlock;
+
   return (
     <Group
       ref={(node) => registerRef(node)}
@@ -290,14 +325,33 @@ function CanvasItemNode(props: {
           listening={false}
         />
       )}
-      <Rect
-        width={item.w}
-        height={item.h}
-        fill={eqColor}
-        opacity={0.7}
-        stroke={selected ? "#0ea5e9" : "#334155"}
-        strokeWidth={selected ? 60 : 20}
-      />
+      {isCustomBlock ? (
+        // 自定义图块：渲染原始 DXF 几何，平移到包围盒原点
+        <>
+          <Rect
+            width={item.w}
+            height={item.h}
+            fill="transparent"
+            stroke={selected ? "#0ea5e9" : "#94a3b8"}
+            strokeWidth={selected ? 60 : 10}
+            dash={selected ? undefined : [60, 40]}
+          />
+          <Group x={-customBlock!.bbox.minX} y={-customBlock!.bbox.minY}>
+            {customBlock!.entities.map((e, i) => (
+              <EntityNode key={i} entity={e} color={customBlock!.color} scale={viewScale} />
+            ))}
+          </Group>
+        </>
+      ) : (
+        <Rect
+          width={item.w}
+          height={item.h}
+          fill={eqColor}
+          opacity={0.7}
+          stroke={selected ? "#0ea5e9" : "#334155"}
+          strokeWidth={selected ? 60 : 20}
+        />
+      )}
       <Text
         text={item.label ?? ""}
         x={0}

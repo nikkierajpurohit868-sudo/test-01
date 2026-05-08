@@ -123,7 +123,7 @@ export type Station = z.infer<typeof Station>;
 
 /* ---------- 画布图元 ---------- */
 
-export const CanvasItemKind = z.enum(["equipment", "element", "annotation", "station"]);
+export const CanvasItemKind = z.enum(["equipment", "element", "annotation", "station", "customBlock"]);
 export type CanvasItemKind = z.infer<typeof CanvasItemKind>;
 
 export const CanvasItem = z.object({
@@ -224,6 +224,204 @@ export const DxfBackground = z.object({
 });
 export type DxfBackground = z.infer<typeof DxfBackground>;
 
+/* ---------- 自定义图块库（从 DXF 抽取） ---------- */
+
+export const CustomBlockCategory = z.enum([
+  "robot",
+  "fixture",
+  "conveyor",
+  "manual_station",
+  "material_buffer",
+  "structural",
+  "other",
+]);
+export type CustomBlockCategory = z.infer<typeof CustomBlockCategory>;
+
+/** 安装/挂载方式 */
+export const MountType = z.enum([
+  "floor",        // 落地
+  "ceiling",      // 顶挂（如机器人吊装）
+  "wall",         // 壁装
+  "on-equipment", // 挂在其他设备上（如夹具挂机床、机器人挂AGV）
+  "embedded",     // 内嵌（如导轨埋入地坪）
+]);
+export type MountType = z.infer<typeof MountType>;
+
+/** 用户自定义属性（visTABLE 风格：name + unit + value + 类型） */
+export const UserAttr = z.object({
+  key: z.string(),
+  label: z.string().default(""),
+  unit: z.string().default(""),
+  type: z.enum(["number", "text", "bool", "enum"]).default("text"),
+  value: z.union([z.string(), z.number(), z.boolean(), z.null()]).default(""),
+  /** type=enum 时的可选值 */
+  options: z.array(z.string()).optional(),
+});
+export type UserAttr = z.infer<typeof UserAttr>;
+
+/** 安全间距 / 干涉避让圈（mm） */
+export const Clearance = z.object({
+  front: z.number().nonnegative().default(0),
+  back: z.number().nonnegative().default(0),
+  left: z.number().nonnegative().default(0),
+  right: z.number().nonnegative().default(0),
+  /** 是否参与干涉检查 */
+  enabled: z.boolean().default(true),
+});
+export type Clearance = z.infer<typeof Clearance>;
+
+/** 工艺/产能参数 */
+export const BlockProcess = z.object({
+  /** 单件循环时间 s */
+  cycleTimeSec: z.number().nonnegative().default(0),
+  /** 小时产能（件/h），可空，由 CT 推导 */
+  throughputPerHour: z.number().nonnegative().optional(),
+  /** 操作工人数 */
+  operators: z.number().nonnegative().default(0),
+  /** 设备综合效率 OEE 0-1 */
+  oee: z.number().min(0).max(1).default(0.85),
+  /** 班次数 */
+  shiftsPerDay: z.number().nonnegative().default(2),
+  /** MTBF/MTTR (h)，可空 */
+  mtbfHours: z.number().nonnegative().optional(),
+  mttrHours: z.number().nonnegative().optional(),
+});
+export type BlockProcess = z.infer<typeof BlockProcess>;
+
+/** 成本参数 */
+export const BlockCost = z.object({
+  /** 一次性投资 ¥ */
+  capex: z.number().nonnegative().default(0),
+  /** 年运维 ¥/年 */
+  opexPerYear: z.number().nonnegative().default(0),
+  /** 功率 kW */
+  powerKW: z.number().nonnegative().default(0),
+  /** 电价 ¥/kWh */
+  powerCostPerKWh: z.number().nonnegative().default(0.8),
+  /** 占地成本 ¥/m²·年（可选） */
+  footprintCostPerM2Year: z.number().nonnegative().optional(),
+  /** 货币 */
+  currency: z.string().default("CNY"),
+});
+export type BlockCost = z.infer<typeof BlockCost>;
+
+/** 挂载/层级关系定义 */
+export const BlockMounting = z.object({
+  type: MountType.default("floor"),
+  /** 默认父图块 ID（同 customBlocks 中的 id），为空表示无 */
+  parentBlockId: z.string().optional(),
+  /** 允许哪些 category 挂载到自己身上（用于拖入吸附） */
+  attachableCategories: z.array(CustomBlockCategory).default([]),
+  /** 默认挂载相对偏移（mm，相对父块基点） */
+  attachOffset: Vec2.default({ x: 0, y: 0 }),
+  /** 是否随父移动 */
+  followParent: z.boolean().default(true),
+});
+export type BlockMounting = z.infer<typeof BlockMounting>;
+
+export const CustomBlock = z.object({
+  id: z.string(),
+  /* ---- identity ---- */
+  name: z.string(),
+  /** 物料/资产编码 */
+  code: z.string().default(""),
+  category: CustomBlockCategory.default("other"),
+  manufacturer: z.string().default(""),
+  model: z.string().default(""),
+  version: z.string().default(""),
+  tags: z.array(z.string()).default([]),
+  description: z.string().default(""),
+
+  /* ---- geometry ---- */
+  /** 几何（坐标已平移到块基点为原点，单位 mm） */
+  entities: z.array(DxfEntity).default([]),
+  /** 局部包围盒（mm） */
+  bbox: z.object({
+    minX: z.number(),
+    minY: z.number(),
+    maxX: z.number(),
+    maxY: z.number(),
+  }),
+  /** 占地（W×H mm），默认从 bbox 推导 */
+  footprint: z.object({ w: z.number().positive(), h: z.number().positive() }),
+  /** 旋转步进（度），0=任意 */
+  rotationStep: z.number().nonnegative().default(0),
+  /** 是否允许镜像 */
+  mirrorable: z.boolean().default(true),
+  /** 锚点（基点）相对 bbox 的位置 */
+  anchor: Vec2.default({ x: 0, y: 0 }),
+
+  /* ---- planning ---- */
+  /** 规划数量（项目目标台数）。实际实例数从 canvasItems 反推。 */
+  plannedQty: z.number().nonnegative().default(0),
+
+  /* ---- 6 大业务属性组 ---- */
+  clearance: Clearance.default({}),
+  process: BlockProcess.default({}),
+  cost: BlockCost.default({}),
+  mounting: BlockMounting.default({}),
+  /** 自定义属性（key-value-unit） */
+  userAttrs: z.array(UserAttr).default([]),
+
+  /* ---- visual ---- */
+  /** 预览缩略图（data URL，可选） */
+  previewDataUrl: z.string().optional(),
+  /** 颜色（边框/填充） */
+  color: z.string().default("#475569"),
+
+  /* ---- 来源 / 主数据链接 ---- */
+  source: z
+    .object({
+      dxfFile: z.string(),
+      blockName: z.string(),
+    })
+    .optional(),
+  /** 知识图谱链接占位（M2 接入设备主数据） */
+  equipmentMasterId: z.string().optional(),
+  /** 自由扩展元数据（保留向后兼容） */
+  metadata: z.record(z.string(), z.unknown()).default({}),
+
+  /* ---- LOD / 瘦身 ---- */
+  /** 瘦身前的原始实体（可选，用于"还原"操作）。仅在做过瘦身后写入。 */
+  originalEntities: z.array(DxfEntity).optional(),
+  /** 当前瘦身配置快照（可重放/审计） */
+  slim: z
+    .object({
+      level: z
+        .enum(["none", "light", "medium", "heavy", "silhouette", "custom"])
+        .default("none"),
+      /** 被丢弃的图层名 */
+      dropLayers: z.array(z.string()).default([]),
+      /** 被丢弃的实体类型 */
+      dropKinds: z
+        .array(z.enum(["line", "polyline", "arc", "circle", "text"]))
+        .default([]),
+      /** 最小线段长度（mm），低于则丢弃 line / polyline */
+      minSegmentLen: z.number().nonnegative().default(0),
+      /** 最小圆弧/圆半径（mm），低于则丢弃 */
+      minRadius: z.number().nonnegative().default(0),
+      /** Douglas-Peucker 折线简化阈值（mm），0=关闭 */
+      rdpEpsilon: z.number().nonnegative().default(0),
+      /** 是否将整体替换为 bbox 矩形轮廓（最激进） */
+      replaceWithBBox: z.boolean().default(false),
+      /** 上次瘦身的统计 */
+      lastBefore: z.number().nonnegative().optional(),
+      lastAfter: z.number().nonnegative().optional(),
+      lastAt: z.string().optional(),
+    })
+    .default({}),
+});
+export type CustomBlock = z.infer<typeof CustomBlock>;
+export const SlimOptions = z.object({
+  dropLayers: z.array(z.string()).default([]),
+  dropKinds: z.array(z.enum(["line", "polyline", "arc", "circle", "text"])).default([]),
+  minSegmentLen: z.number().nonnegative().default(0),
+  minRadius: z.number().nonnegative().default(0),
+  rdpEpsilon: z.number().nonnegative().default(0),
+  replaceWithBBox: z.boolean().default(false),
+});
+export type SlimOptions = z.infer<typeof SlimOptions>;
+
 /* ---------- 项目（顶层聚合根） ---------- */
 
 export const ProjectMeta = z.object({
@@ -248,6 +446,8 @@ export const Project = z.object({
   layers: z.array(CanvasLayer).default([]),
   canvasItems: z.array(CanvasItem).default([]),
   dxfBackgrounds: z.array(DxfBackground).default([]),
+  /** 用户从 DXF 抽取的自定义图块库（项目内可见） */
+  customBlocks: z.array(CustomBlock).default([]),
 });
 export type Project = z.infer<typeof Project>;
 

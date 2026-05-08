@@ -15,8 +15,15 @@ import {
   type Operation,
   type Station,
   type DxfBackground,
+  type CustomBlock,
+  type SlimOptions,
+  CustomBlock as CustomBlockSchema,
   newProject,
 } from "@ilp/schema";
+import { slimEntities, presetOptions, type SlimPreset } from "@/lib/slimBlock";
+
+/** addCustomBlocks 接受的输入类型：复用 zod schema 的 input 类型（默认字段可省略） */
+export type CustomBlockInput = Omit<Parameters<typeof CustomBlockSchema.parse>[0], "id">;
 import { findTemplate, type EquipmentTemplate } from "@/lib/equipmentLibrary";
 import { saveProject } from "@/db/dexie";
 
@@ -57,6 +64,31 @@ interface ProjectStore {
   addDxfBackground: (bg: Omit<DxfBackground, "id">) => string;
   updateDxfBackground: (id: string, patch: Partial<DxfBackground>) => void;
   deleteDxfBackground: (id: string) => void;
+
+  // ------- 自定义图块库 -------
+  addCustomBlocks: (blocks: CustomBlockInput[]) => string[];
+  updateCustomBlock: (id: string, patch: Partial<CustomBlock>) => void;
+  deleteCustomBlock: (id: string) => void;
+  /** 拖入画布：实例化一个 CustomBlock */
+  addCanvasItemFromCustomBlock: (block: CustomBlock, x: number, y: number) => string;
+  /** 瘦身：自定义参数 */
+  slimCustomBlock: (
+    id: string,
+    opts: SlimOptions,
+    level?: CustomBlock["slim"]["level"]
+  ) => { before: number; after: number } | null;
+  /** 瘦身：使用预设 */
+  slimCustomBlockPreset: (
+    id: string,
+    preset: SlimPreset
+  ) => { before: number; after: number } | null;
+  /** 还原到瘦身前 */
+  restoreCustomBlock: (id: string) => boolean;
+  /** 批量瘦身：仅对 entities 数 >= threshold 的图块应用预设 */
+  slimAllCustomBlocks: (
+    preset: SlimPreset,
+    threshold: number
+  ) => { affected: number; before: number; after: number };
 }
 
 let saveTimer: number | undefined;
@@ -243,6 +275,157 @@ export const useProjectStore = create<ProjectStore>()((set, _get) => {
     mutate((p) => {
       p.dxfBackgrounds = p.dxfBackgrounds.filter((b) => b.id !== id);
     }),
+
+  addCustomBlocks: (blocks) => {
+    const ids: string[] = [];
+    mutate((p) => {
+      for (const b of blocks) {
+        const id = nanoid();
+        ids.push(id);
+        // 用 zod 解析补齐 clearance/process/cost/mounting 等默认值
+        const parsed = CustomBlockSchema.parse({ ...b, id });
+        p.customBlocks.push(parsed);
+      }
+    });
+    return ids;
+  },
+  updateCustomBlock: (id, patch) =>
+    mutate((p) => {
+      const b = p.customBlocks.find((x) => x.id === id);
+      if (b) Object.assign(b, patch);
+    }),
+  deleteCustomBlock: (id) =>
+    mutate((p) => {
+      p.customBlocks = p.customBlocks.filter((b) => b.id !== id);
+    }),
+
+  slimCustomBlock: (id, opts, level = "custom") => {
+    let result: { before: number; after: number } | null = null;
+    mutate((p) => {
+      const b = p.customBlocks.find((x) => x.id === id);
+      if (!b) return;
+      // 始终基于 originalEntities（首次瘦身则把当前 entities 作为 backup）
+      if (!b.originalEntities) b.originalEntities = b.entities.slice();
+      const r = slimEntities(b.originalEntities, b.bbox, opts);
+      b.entities = r.entities;
+      // 注意：previewDataUrl 与 footprint 暂不重算，瘦身不应改变占位
+      b.slim = {
+        level,
+        dropLayers: opts.dropLayers ?? [],
+        dropKinds: opts.dropKinds ?? [],
+        minSegmentLen: opts.minSegmentLen ?? 0,
+        minRadius: opts.minRadius ?? 0,
+        rdpEpsilon: opts.rdpEpsilon ?? 0,
+        replaceWithBBox: opts.replaceWithBBox ?? false,
+        lastBefore: r.before,
+        lastAfter: r.after,
+        lastAt: new Date().toISOString(),
+      };
+      result = { before: r.before, after: r.after };
+    });
+    return result;
+  },
+
+  slimCustomBlockPreset: (id, preset) => {
+    let result: { before: number; after: number } | null = null;
+    mutate((p) => {
+      const b = p.customBlocks.find((x) => x.id === id);
+      if (!b) return;
+      if (!b.originalEntities) b.originalEntities = b.entities.slice();
+      const opts = presetOptions(preset, b.bbox);
+      const r = slimEntities(b.originalEntities, b.bbox, opts);
+      b.entities = r.entities;
+      b.slim = {
+        level: preset,
+        dropLayers: opts.dropLayers,
+        dropKinds: opts.dropKinds,
+        minSegmentLen: opts.minSegmentLen,
+        minRadius: opts.minRadius,
+        rdpEpsilon: opts.rdpEpsilon,
+        replaceWithBBox: opts.replaceWithBBox,
+        lastBefore: r.before,
+        lastAfter: r.after,
+        lastAt: new Date().toISOString(),
+      };
+      result = { before: r.before, after: r.after };
+    });
+    return result;
+  },
+
+  restoreCustomBlock: (id) => {
+    let ok = false;
+    mutate((p) => {
+      const b = p.customBlocks.find((x) => x.id === id);
+      if (!b || !b.originalEntities) return;
+      b.entities = b.originalEntities.slice();
+      delete b.originalEntities;
+      b.slim = {
+        level: "none",
+        dropLayers: [],
+        dropKinds: [],
+        minSegmentLen: 0,
+        minRadius: 0,
+        rdpEpsilon: 0,
+        replaceWithBBox: false,
+      };
+      ok = true;
+    });
+    return ok;
+  },
+
+  slimAllCustomBlocks: (preset, threshold) => {
+    let affected = 0;
+    let before = 0;
+    let after = 0;
+    mutate((p) => {
+      for (const b of p.customBlocks) {
+        const src = b.originalEntities ?? b.entities;
+        if (src.length < threshold) continue;
+        if (!b.originalEntities) b.originalEntities = b.entities.slice();
+        const opts = presetOptions(preset, b.bbox);
+        const r = slimEntities(b.originalEntities, b.bbox, opts);
+        b.entities = r.entities;
+        b.slim = {
+          level: preset,
+          dropLayers: opts.dropLayers,
+          dropKinds: opts.dropKinds,
+          minSegmentLen: opts.minSegmentLen,
+          minRadius: opts.minRadius,
+          rdpEpsilon: opts.rdpEpsilon,
+          replaceWithBBox: opts.replaceWithBBox,
+          lastBefore: r.before,
+          lastAfter: r.after,
+          lastAt: new Date().toISOString(),
+        };
+        affected += 1;
+        before += r.before;
+        after += r.after;
+      }
+    });
+    return { affected, before, after };
+  },
+
+  addCanvasItemFromCustomBlock: (block, x, y) => {
+    const itemId = nanoid();
+    mutate((p) => {
+      p.canvasItems.push({
+        id: itemId,
+        kind: "customBlock",
+        refId: block.id,
+        x,
+        y,
+        w: block.footprint.w,
+        h: block.footprint.h,
+        rotation: 0,
+        layerId: "default",
+        visible: true,
+        locked: false,
+        label: block.name,
+        style: {},
+      });
+    });
+    return itemId;
+  },
   });
 });
 

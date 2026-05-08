@@ -1,21 +1,21 @@
 /**
- * DXF 解析（增强版）
- *  - 递归展开 INSERT 块引用 (核心：厂房 DXF 主要内容都在 BLOCK 表里)
+ * DXF 解析 + 图块抽取
+ *  - parseDxfFile/parseDxfText: 完整解析整张图（展开所有 INSERT），用于底图
+ *  - extractDxfBlocks: 仅提取 BLOCK 表里的定义（坐标平移到块基点为原点），用于建库
  *  - 支持 LINE / LWPOLYLINE / POLYLINE / CIRCLE / ARC / ELLIPSE / SPLINE / TEXT / MTEXT / SOLID / 3DFACE
  *  - LWPOLYLINE bulge 弧段近似为折线
- *  - 单位换算：$INSUNITS → mm
- *  - 对每个 entity 应用 INSERT 链路上的 (translate, rotate, scale) 变换
+ *  - 主线程入口优先走 Web Worker，失败时降级同步解析
  */
 import DxfParser from "dxf-parser";
 import type { DxfEntity } from "@ilp/schema";
 
 const INSUNITS_TO_MM: Record<number, number> = {
   0: 1,
-  1: 25.4, // inch
-  2: 304.8, // foot
-  4: 1, // mm
-  5: 10, // cm
-  6: 1000, // m
+  1: 25.4,
+  2: 304.8,
+  4: 1,
+  5: 10,
+  6: 1000,
 };
 
 /** 2D 仿射变换矩阵 [a c tx; b d ty; 0 0 1] */
@@ -27,13 +27,11 @@ interface Tx {
   tx: number;
   ty: number;
 }
-const ID: Tx = { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 };
 
 function applyTx(t: Tx, x: number, y: number): [number, number] {
   return [t.a * x + t.c * y + t.tx, t.b * x + t.d * y + t.ty];
 }
 function compose(outer: Tx, inner: Tx): Tx {
-  // outer * inner
   return {
     a: outer.a * inner.a + outer.c * inner.b,
     b: outer.b * inner.a + outer.d * inner.b,
@@ -58,21 +56,16 @@ function makeTx(opts: { tx?: number; ty?: number; rotDeg?: number; sx?: number; 
     ty: opts.ty ?? 0,
   };
 }
-/** 提取 t 中的均匀缩放因子（用于 r/text height 之类标量） */
 function txScale(t: Tx): number {
   return Math.sqrt(Math.abs(t.a * t.d - t.b * t.c));
 }
 
-export type DxfProgressPhase = "read" | "parse" | "expand" | "done";
+export type DxfProgressPhase = "read" | "parse" | "expand" | "extract" | "done";
 export interface DxfProgress {
   phase: DxfProgressPhase;
-  /** 当前已处理实体数（expand 阶段递增） */
   processed: number;
-  /** 顶层 entities 数（已知总数） */
   topLevelTotal: number;
-  /** 已展开的 INSERT 数 */
   insertsExpanded: number;
-  /** 文件大小 bytes（read 阶段） */
   fileBytes?: number;
   message?: string;
 }
@@ -82,107 +75,83 @@ export interface ParsedDxf {
   entities: DxfEntity[];
   bbox: { minX: number; minY: number; maxX: number; maxY: number };
   unitScale: number;
-  /** 解析摘要：每种 DXF 实体类型出现次数 */
   stats: Record<string, number>;
-  /** 已忽略的实体类型 */
   ignored: Record<string, number>;
-  /** 展开的 INSERT 数 */
   insertsExpanded: number;
-  /** 引用了但未在 BLOCKS 表中找到的块名 */
   missingBlocks: string[];
+}
+
+export interface ExtractedBlock {
+  /** 原始 BLOCK 名 */
+  name: string;
+  entities: DxfEntity[];
+  bbox: { minX: number; minY: number; maxX: number; maxY: number };
+  /** 包含的实体计数（按类型） */
+  stats: Record<string, number>;
+  insertsExpanded: number;
 }
 
 const yieldToUi = () => new Promise<void>((r) => setTimeout(r, 0));
 
-export async function parseDxfFile(
-  file: File,
-  onProgress?: DxfProgressCallback
-): Promise<ParsedDxf> {
-  onProgress?.({
-    phase: "read",
-    processed: 0,
-    topLevelTotal: 0,
+/* ============================================================
+ *  Entity Processor 工厂：复用 entity → DxfEntity 转换的核心逻辑
+ * ============================================================ */
+
+interface ProcessorState {
+  out: DxfEntity[];
+  stats: Record<string, number>;
+  ignored: Record<string, number>;
+  missingBlocks: Set<string>;
+  insertsExpanded: number;
+  processedCount: number;
+  bbox: { minX: number; minY: number; maxX: number; maxY: number };
+}
+
+interface Processor {
+  state: ProcessorState;
+  /** 处理一组实体，应用变换矩阵 */
+  processEntities: (ents: any[], tx: Tx, depth: number) => Promise<void>;
+  /** 获取最终 bbox（无穷大归零） */
+  finalBBox: () => { minX: number; minY: number; maxX: number; maxY: number };
+}
+
+function createProcessor(blocks: Record<string, any>, onYield?: () => Promise<void>): Processor {
+  const state: ProcessorState = {
+    out: [],
+    stats: {},
+    ignored: {},
+    missingBlocks: new Set<string>(),
     insertsExpanded: 0,
-    fileBytes: file.size,
-    message: `读取文件 ${(file.size / 1024).toFixed(0)} KB`,
-  });
-  await yieldToUi();
-  const text = await file.text();
-
-  onProgress?.({
-    phase: "parse",
-    processed: 0,
-    topLevelTotal: 0,
-    insertsExpanded: 0,
-    fileBytes: file.size,
-    message: "解析 DXF 结构（同步阶段，文件大可能卡顿）...",
-  });
-  await yieldToUi();
-
-  const parser = new DxfParser();
-  let dxf: any;
-  try {
-    dxf = parser.parseSync(text);
-  } catch (e) {
-    throw new Error(`DXF 解析失败: ${(e as Error).message}`);
-  }
-  if (!dxf) throw new Error("DXF 解析返回空");
-
-  const insunits = dxf.header?.$INSUNITS ?? 0;
-  const unitScale = INSUNITS_TO_MM[insunits] ?? 1;
-
-  const blocks: Record<string, any> = dxf.blocks ?? {};
-  const out: DxfEntity[] = [];
-  const stats: Record<string, number> = {};
-  const ignored: Record<string, number> = {};
-  const missingBlocks = new Set<string>();
-  let insertsExpanded = 0;
-
-  let minX = Infinity,
-    minY = Infinity,
-    maxX = -Infinity,
-    maxY = -Infinity;
-  const expand = (x: number, y: number) => {
-    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-    if (x < minX) minX = x;
-    if (y < minY) minY = y;
-    if (x > maxX) maxX = x;
-    if (y > maxY) maxY = y;
+    processedCount: 0,
+    bbox: { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity },
   };
-
-  // 全局：先把 modelspace 单位放大（在变换最外层乘 unitScale）
-  const rootTx = makeTx({ sx: unitScale, sy: unitScale });
-
-  // 防止循环引用
   const visiting = new Set<string>();
-
-  const topLevelTotal = (dxf.entities ?? []).length;
-  let processedCount = 0;
   const PROGRESS_BATCH = 1500;
   let nextYieldAt = PROGRESS_BATCH;
 
+  const expand = (x: number, y: number) => {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    if (x < state.bbox.minX) state.bbox.minX = x;
+    if (y < state.bbox.minY) state.bbox.minY = y;
+    if (x > state.bbox.maxX) state.bbox.maxX = x;
+    if (y > state.bbox.maxY) state.bbox.maxY = y;
+  };
+
   const processEntities = async (ents: any[], tx: Tx, depth: number): Promise<void> => {
-    if (depth > 8) return; // 安全护栏
+    if (depth > 8) return;
     for (const e of ents ?? []) {
       await processEntity(e, tx, depth);
     }
   };
 
   const processEntity = async (e: any, tx: Tx, depth: number): Promise<void> => {
-    processedCount++;
-    if (processedCount >= nextYieldAt) {
+    state.processedCount++;
+    if (state.processedCount >= nextYieldAt) {
       nextYieldAt += PROGRESS_BATCH;
-      onProgress?.({
-        phase: "expand",
-        processed: processedCount,
-        topLevelTotal,
-        insertsExpanded,
-        message: `处理实体 ${processedCount}（INSERT 已展开 ${insertsExpanded}）`,
-      });
-      await yieldToUi();
+      if (onYield) await onYield();
     }
     const type = e.type as string;
-    stats[type] = (stats[type] ?? 0) + 1;
+    state.stats[type] = (state.stats[type] ?? 0) + 1;
     const layer = e.layer as string | undefined;
     const s = txScale(tx);
 
@@ -190,7 +159,7 @@ export async function parseDxfFile(
       case "LINE": {
         const [x1, y1] = applyTx(tx, e.vertices?.[0]?.x ?? 0, e.vertices?.[0]?.y ?? 0);
         const [x2, y2] = applyTx(tx, e.vertices?.[1]?.x ?? 0, e.vertices?.[1]?.y ?? 0);
-        out.push({ kind: "line", points: [x1, y1, x2, y2], layer });
+        state.out.push({ kind: "line", points: [x1, y1, x2, y2], layer });
         expand(x1, y1);
         expand(x2, y2);
         break;
@@ -204,14 +173,12 @@ export async function parseDxfFile(
           const [x, y] = applyTx(tx, v.x ?? 0, v.y ?? 0);
           pts.push(x, y);
           expand(x, y);
-
-          // 处理 bulge（弧段）：在 v 与 next 之间加密
           const bulge = v.bulge ?? 0;
           if (bulge !== 0 && i < verts.length - 1) {
             const v2 = verts[i + 1];
-            const [x1, y1] = applyTx(tx, v.x ?? 0, v.y ?? 0);
-            const [x2, y2] = applyTx(tx, v2.x ?? 0, v2.y ?? 0);
-            const arcPts = sampleBulge(x1, y1, x2, y2, bulge, 16);
+            const [bx1, by1] = applyTx(tx, v.x ?? 0, v.y ?? 0);
+            const [bx2, by2] = applyTx(tx, v2.x ?? 0, v2.y ?? 0);
+            const arcPts = sampleBulge(bx1, by1, bx2, by2, bulge, 16);
             for (let k = 0; k < arcPts.length; k += 2) {
               const ax = arcPts[k]!;
               const ay = arcPts[k + 1]!;
@@ -221,7 +188,7 @@ export async function parseDxfFile(
           }
         }
         if (pts.length >= 4) {
-          out.push({
+          state.out.push({
             kind: "polyline",
             points: pts,
             closed: !!e.shape || !!e.closed,
@@ -233,13 +200,12 @@ export async function parseDxfFile(
       case "CIRCLE": {
         const [cx, cy] = applyTx(tx, e.center?.x ?? 0, e.center?.y ?? 0);
         const r = (e.radius ?? 0) * s;
-        out.push({ kind: "circle", cx, cy, r, layer });
+        state.out.push({ kind: "circle", cx, cy, r, layer });
         expand(cx - r, cy - r);
         expand(cx + r, cy + r);
         break;
       }
       case "ARC": {
-        // ARC 旋转受 tx 旋转影响：sample 成 polyline 更稳
         const cxL = e.center?.x ?? 0;
         const cyL = e.center?.y ?? 0;
         const r = e.radius ?? 0;
@@ -252,11 +218,10 @@ export async function parseDxfFile(
           transformed.push(x, y);
           expand(x, y);
         }
-        out.push({ kind: "polyline", points: transformed, closed: false, layer });
+        state.out.push({ kind: "polyline", points: transformed, closed: false, layer });
         break;
       }
       case "ELLIPSE": {
-        // dxf-parser: center, majorAxisEndPoint(相对于 center), axisRatio, startAngle/endAngle (param)
         const cxL = e.center?.x ?? 0;
         const cyL = e.center?.y ?? 0;
         const mx = e.majorAxisEndPoint?.x ?? 0;
@@ -278,7 +243,7 @@ export async function parseDxfFile(
           transformed.push(x, y);
           expand(x, y);
         }
-        out.push({
+        state.out.push({
           kind: "polyline",
           points: transformed,
           closed: Math.abs(t1 - t0 - Math.PI * 2) < 1e-3,
@@ -287,7 +252,6 @@ export async function parseDxfFile(
         break;
       }
       case "SPLINE": {
-        // 使用控制点或拟合点作为折线近似（对底图视觉参考够用）
         const fp = e.fitPoints ?? [];
         const cp = e.controlPoints ?? [];
         const src = fp.length > 0 ? fp : cp;
@@ -298,17 +262,21 @@ export async function parseDxfFile(
           transformed.push(x, y);
           expand(x, y);
         }
-        out.push({ kind: "polyline", points: transformed, closed: !!e.closed, layer });
+        state.out.push({ kind: "polyline", points: transformed, closed: !!e.closed, layer });
         break;
       }
       case "TEXT":
       case "MTEXT": {
-        const [x, y] = applyTx(tx, e.startPoint?.x ?? e.position?.x ?? 0, e.startPoint?.y ?? e.position?.y ?? 0);
+        const [x, y] = applyTx(
+          tx,
+          e.startPoint?.x ?? e.position?.x ?? 0,
+          e.startPoint?.y ?? e.position?.y ?? 0
+        );
         const height = (e.textHeight ?? e.height ?? 100) * s;
         const rotation = (e.rotation ?? 0) + Math.atan2(tx.b, tx.a) * (180 / Math.PI);
         const txt = (e.text ?? "").toString();
         if (txt) {
-          out.push({ kind: "text", x, y, text: txt, height, rotation, layer });
+          state.out.push({ kind: "text", x, y, text: txt, height, rotation, layer });
           expand(x, y);
           expand(x + txt.length * height * 0.6, y + height);
         }
@@ -317,7 +285,6 @@ export async function parseDxfFile(
       case "SOLID":
       case "3DFACE": {
         const verts = [e.points?.[0], e.points?.[1], e.points?.[3], e.points?.[2]].filter(Boolean);
-        // SOLID/3DFACE 顶点 0,1,3,2 顺序构成四边形
         const pts: number[] = [];
         for (const v of verts) {
           if (!v) continue;
@@ -326,7 +293,7 @@ export async function parseDxfFile(
           expand(x, y);
         }
         if (pts.length >= 6) {
-          out.push({ kind: "polyline", points: pts, closed: true, layer });
+          state.out.push({ kind: "polyline", points: pts, closed: true, layer });
         }
         break;
       }
@@ -334,14 +301,13 @@ export async function parseDxfFile(
         const blockName = e.name as string;
         const blk = blocks[blockName];
         if (!blk) {
-          missingBlocks.add(blockName);
+          state.missingBlocks.add(blockName);
           break;
         }
-        if (visiting.has(blockName)) break; // 循环引用保护
+        if (visiting.has(blockName)) break;
         visiting.add(blockName);
-        insertsExpanded++;
+        state.insertsExpanded++;
 
-        // INSERT 局部变换：先按 block.position(基点) 平移到原点，再缩放，再旋转，最后平移到插入点
         const ix = e.position?.x ?? 0;
         const iy = e.position?.y ?? 0;
         const xs = e.xScale ?? 1;
@@ -356,7 +322,6 @@ export async function parseDxfFile(
         );
         const newTx = compose(tx, tInsert);
 
-        // ARRAY (column/row count) — 简化处理：只处理 1×1，复杂阵列暂忽略
         const colCount = e.columnCount ?? 1;
         const rowCount = e.rowCount ?? 1;
         const colSpacing = e.columnSpacing ?? 0;
@@ -369,7 +334,13 @@ export async function parseDxfFile(
                 : compose(
                     tx,
                     compose(
-                      makeTx({ tx: ix + c * colSpacing, ty: iy + r * rowSpacing, rotDeg: rot, sx: xs, sy: ys }),
+                      makeTx({
+                        tx: ix + c * colSpacing,
+                        ty: iy + r * rowSpacing,
+                        rotDeg: rot,
+                        sx: xs,
+                        sy: ys,
+                      }),
                       makeTx({ tx: -bx, ty: -by })
                     )
                   );
@@ -380,10 +351,120 @@ export async function parseDxfFile(
         break;
       }
       default:
-        ignored[type] = (ignored[type] ?? 0) + 1;
+        state.ignored[type] = (state.ignored[type] ?? 0) + 1;
         break;
     }
   };
+
+  const finalBBox = () => {
+    const b = state.bbox;
+    if (!Number.isFinite(b.minX)) return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+    return { ...b };
+  };
+
+  return { state, processEntities, finalBBox };
+}
+
+/* ============================================================
+ *  完整解析（用作底图）
+ * ============================================================ */
+
+/**
+ * 主线程入口：自动用 Web Worker 解析（不卡 UI）；Worker 失败时降级同步
+ */
+export async function parseDxfFile(
+  file: File,
+  onProgress?: DxfProgressCallback
+): Promise<ParsedDxf> {
+  onProgress?.({
+    phase: "read",
+    processed: 0,
+    topLevelTotal: 0,
+    insertsExpanded: 0,
+    fileBytes: file.size,
+    message: `读取文件 ${(file.size / 1024 / 1024).toFixed(1)} MB`,
+  });
+  const text = await file.text();
+
+  try {
+    return await parseDxfTextInWorker(text, file.size, onProgress);
+  } catch (e) {
+    console.warn("[dxf] worker 失败，回退主线程同步解析:", e);
+    return parseDxfText(text, file.size, onProgress);
+  }
+}
+
+function parseDxfTextInWorker(
+  text: string,
+  fileSize: number,
+  onProgress?: DxfProgressCallback
+): Promise<ParsedDxf> {
+  return new Promise((resolve, reject) => {
+    let worker: Worker;
+    try {
+      worker = new Worker(new URL("./dxfWorker.ts", import.meta.url), { type: "module" });
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    worker.onmessage = (ev: MessageEvent) => {
+      const m = ev.data;
+      if (m.type === "progress") onProgress?.(m.payload);
+      else if (m.type === "done") {
+        worker.terminate();
+        resolve(m.payload as ParsedDxf);
+      } else if (m.type === "error") {
+        worker.terminate();
+        reject(new Error(m.message));
+      }
+    };
+    worker.onerror = (ev) => {
+      worker.terminate();
+      reject(new Error(ev.message || "worker error"));
+    };
+    worker.postMessage({ type: "parseFull", text, fileSize });
+  });
+}
+
+export async function parseDxfText(
+  text: string,
+  fileSize: number,
+  onProgress?: DxfProgressCallback
+): Promise<ParsedDxf> {
+  onProgress?.({
+    phase: "parse",
+    processed: 0,
+    topLevelTotal: 0,
+    insertsExpanded: 0,
+    fileBytes: fileSize,
+    message: "解析 DXF 结构...",
+  });
+  await yieldToUi();
+
+  const parser = new DxfParser();
+  let dxf: any;
+  try {
+    dxf = parser.parseSync(text);
+  } catch (e) {
+    throw new Error(`DXF 解析失败: ${(e as Error).message}`);
+  }
+  if (!dxf) throw new Error("DXF 解析返回空");
+
+  const insunits = dxf.header?.$INSUNITS ?? 0;
+  const unitScale = INSUNITS_TO_MM[insunits] ?? 1;
+  const blocks: Record<string, any> = dxf.blocks ?? {};
+  const topLevelTotal = (dxf.entities ?? []).length;
+
+  const proc = createProcessor(blocks, async () => {
+    onProgress?.({
+      phase: "expand",
+      processed: proc.state.processedCount,
+      topLevelTotal,
+      insertsExpanded: proc.state.insertsExpanded,
+      message: `处理实体 ${proc.state.processedCount}（INSERT 已展开 ${proc.state.insertsExpanded}）`,
+    });
+    await yieldToUi();
+  });
 
   onProgress?.({
     phase: "expand",
@@ -394,38 +475,204 @@ export async function parseDxfFile(
   });
   await yieldToUi();
 
-  await processEntities(dxf.entities ?? [], rootTx, 0);
+  const rootTx = makeTx({ sx: unitScale, sy: unitScale });
+  await proc.processEntities(dxf.entities ?? [], rootTx, 0);
 
   onProgress?.({
     phase: "done",
-    processed: processedCount,
+    processed: proc.state.processedCount,
     topLevelTotal,
-    insertsExpanded,
-    message: `完成：${out.length} 个图元`,
+    insertsExpanded: proc.state.insertsExpanded,
+    message: `完成：${proc.state.out.length} 个图元`,
   });
 
-  if (!Number.isFinite(minX)) {
-    minX = 0;
-    minY = 0;
-    maxX = 0;
-    maxY = 0;
-  }
-
   return {
-    entities: out,
-    bbox: { minX, minY, maxX, maxY },
+    entities: proc.state.out,
+    bbox: proc.finalBBox(),
     unitScale,
-    stats,
-    ignored,
-    insertsExpanded,
-    missingBlocks: [...missingBlocks],
+    stats: proc.state.stats,
+    ignored: proc.state.ignored,
+    insertsExpanded: proc.state.insertsExpanded,
+    missingBlocks: [...proc.state.missingBlocks],
   };
 }
 
-/** 在 (cx,cy) 半径 r 上从 sa 到 ea（弧度）采样点，输出 [x0,y0,x1,y1,...] */
+/* ============================================================
+ *  图块抽取（用作建库）
+ * ============================================================ */
+
+export interface ExtractBlocksResult {
+  blocks: ExtractedBlock[];
+  unitScale: number;
+  /** 跳过的块数（系统块、空块） */
+  skipped: number;
+  /** 来源文件名 */
+  sourceFile: string;
+}
+
+export async function extractDxfBlocksFromFile(
+  file: File,
+  onProgress?: DxfProgressCallback
+): Promise<ExtractBlocksResult> {
+  onProgress?.({
+    phase: "read",
+    processed: 0,
+    topLevelTotal: 0,
+    insertsExpanded: 0,
+    fileBytes: file.size,
+    message: `读取文件 ${(file.size / 1024 / 1024).toFixed(1)} MB`,
+  });
+  const text = await file.text();
+
+  try {
+    return await extractDxfBlocksInWorker(text, file.size, file.name, onProgress);
+  } catch (e) {
+    console.warn("[dxf] worker 失败，回退主线程提取:", e);
+    return extractDxfBlocksText(text, file.size, file.name, onProgress);
+  }
+}
+
+function extractDxfBlocksInWorker(
+  text: string,
+  fileSize: number,
+  fileName: string,
+  onProgress?: DxfProgressCallback
+): Promise<ExtractBlocksResult> {
+  return new Promise((resolve, reject) => {
+    let worker: Worker;
+    try {
+      worker = new Worker(new URL("./dxfWorker.ts", import.meta.url), { type: "module" });
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    worker.onmessage = (ev: MessageEvent) => {
+      const m = ev.data;
+      if (m.type === "progress") onProgress?.(m.payload);
+      else if (m.type === "done") {
+        worker.terminate();
+        resolve(m.payload as ExtractBlocksResult);
+      } else if (m.type === "error") {
+        worker.terminate();
+        reject(new Error(m.message));
+      }
+    };
+    worker.onerror = (ev) => {
+      worker.terminate();
+      reject(new Error(ev.message || "worker error"));
+    };
+    worker.postMessage({ type: "extractBlocks", text, fileSize, fileName });
+  });
+}
+
+export async function extractDxfBlocksText(
+  text: string,
+  fileSize: number,
+  fileName: string,
+  onProgress?: DxfProgressCallback
+): Promise<ExtractBlocksResult> {
+  onProgress?.({
+    phase: "parse",
+    processed: 0,
+    topLevelTotal: 0,
+    insertsExpanded: 0,
+    fileBytes: fileSize,
+    message: "解析 DXF 结构...",
+  });
+  await yieldToUi();
+
+  const parser = new DxfParser();
+  let dxf: any;
+  try {
+    dxf = parser.parseSync(text);
+  } catch (e) {
+    throw new Error(`DXF 解析失败: ${(e as Error).message}`);
+  }
+  if (!dxf) throw new Error("DXF 解析返回空");
+
+  const insunits = dxf.header?.$INSUNITS ?? 0;
+  const unitScale = INSUNITS_TO_MM[insunits] ?? 1;
+  const blocks: Record<string, any> = dxf.blocks ?? {};
+  const blockNames = Object.keys(blocks).filter((n) => !n.startsWith("*"));
+  const totalBlocks = blockNames.length;
+
+  onProgress?.({
+    phase: "extract",
+    processed: 0,
+    topLevelTotal: totalBlocks,
+    insertsExpanded: 0,
+    message: `开始抽取 ${totalBlocks} 个块定义`,
+  });
+  await yieldToUi();
+
+  const result: ExtractedBlock[] = [];
+  let skipped = 0;
+  let i = 0;
+
+  for (const name of blockNames) {
+    i++;
+    const blk = blocks[name];
+    if (!blk?.entities || blk.entities.length === 0) {
+      skipped++;
+      continue;
+    }
+
+    // 单块独立 processor：rootTx 把块基点平移到原点 + 单位换算
+    const proc = createProcessor(blocks);
+    const bx = blk.position?.x ?? 0;
+    const by = blk.position?.y ?? 0;
+    const rootTx = compose(makeTx({ sx: unitScale, sy: unitScale }), makeTx({ tx: -bx, ty: -by }));
+
+    try {
+      await proc.processEntities(blk.entities, rootTx, 0);
+    } catch (e) {
+      console.warn(`[dxf] 块 ${name} 处理失败:`, e);
+      skipped++;
+      continue;
+    }
+
+    if (proc.state.out.length === 0) {
+      skipped++;
+      continue;
+    }
+
+    result.push({
+      name,
+      entities: proc.state.out,
+      bbox: proc.finalBBox(),
+      stats: proc.state.stats,
+      insertsExpanded: proc.state.insertsExpanded,
+    });
+
+    if (i % 25 === 0) {
+      onProgress?.({
+        phase: "extract",
+        processed: i,
+        topLevelTotal: totalBlocks,
+        insertsExpanded: 0,
+        message: `已抽取 ${result.length}/${i}（跳过 ${skipped}）`,
+      });
+      await yieldToUi();
+    }
+  }
+
+  onProgress?.({
+    phase: "done",
+    processed: i,
+    topLevelTotal: totalBlocks,
+    insertsExpanded: 0,
+    message: `完成：${result.length} 个有效图块（跳过 ${skipped}）`,
+  });
+
+  return { blocks: result, unitScale, skipped, sourceFile: fileName };
+}
+
+/* ============================================================
+ *  几何采样工具
+ * ============================================================ */
+
 function sampleArc(cx: number, cy: number, r: number, sa: number, ea: number, segs: number): number[] {
   let span = ea - sa;
-  // 规范化跨度到 [0, 2π]
   if (span < 0) span += Math.PI * 2;
   if (span === 0) span = Math.PI * 2;
   const out: number[] = [];
@@ -436,11 +683,6 @@ function sampleArc(cx: number, cy: number, r: number, sa: number, ea: number, se
   return out;
 }
 
-/**
- * Bulge 弧段采样
- *  bulge = tan(includedAngle / 4)
- *  正值=逆时针，负值=顺时针
- */
 function sampleBulge(
   x1: number,
   y1: number,
@@ -454,7 +696,6 @@ function sampleBulge(
   const r = chord / (2 * Math.sin(Math.abs(theta) / 2));
   const mx = (x1 + x2) / 2;
   const my = (y1 + y2) / 2;
-  // 垂直于弦的方向
   const nx = -(y2 - y1) / chord;
   const ny = (x2 - x1) / chord;
   const sagitta = r - r * Math.cos(theta / 2);

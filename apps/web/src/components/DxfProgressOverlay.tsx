@@ -4,6 +4,7 @@ const PHASE_LABEL: Record<DxfProgress["phase"], string> = {
   read: "1/3 读取文件",
   parse: "2/3 解析 DXF",
   expand: "3/3 展开实体",
+  extract: "3/3 抽取图块",
   done: "完成",
 };
 

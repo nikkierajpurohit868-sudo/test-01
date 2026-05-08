@@ -1,10 +1,21 @@
-import { FilePlus2, FolderOpen, Save, FileSpreadsheet, Image as ImageIcon, Magnet } from "lucide-react";
+import {
+  FilePlus2,
+  FolderOpen,
+  Save,
+  FileSpreadsheet,
+  Image as ImageIcon,
+  Magnet,
+  PackagePlus,
+  Zap,
+} from "lucide-react";
 import { useRef, useState } from "react";
 import { useProjectStore } from "@/store/projectStore";
 import { exportProjectZip, importProjectZip } from "@/io/projectFile";
 import { exportProjectToExcel } from "@/io/excelExport";
 import { parseDxfFile, type DxfProgress } from "@/dxf/parseDxf";
 import { DxfProgressOverlay } from "@/components/DxfProgressOverlay";
+import { BlockImportWizard } from "@/components/BlockImportWizard";
+import { BatchSlimDialog } from "@/components/BatchSlimDialog";
 
 export function Toolbar() {
   const project = useProjectStore((s) => s.project);
@@ -17,6 +28,8 @@ export function Toolbar() {
   const fileRef = useRef<HTMLInputElement>(null);
   const dxfRef = useRef<HTMLInputElement>(null);
   const [dxfProgress, setDxfProgress] = useState<DxfProgress | null>(null);
+  const [showBlockWizard, setShowBlockWizard] = useState(false);
+  const [showBatchSlim, setShowBatchSlim] = useState(false);
 
   const onPickFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
@@ -34,6 +47,20 @@ export function Toolbar() {
   const onPickDxf = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     if (!f) return;
+    const sizeMB = f.size / 1024 / 1024;
+    if (sizeMB > 50) {
+      const ok = confirm(
+        `DXF 文件较大 (${sizeMB.toFixed(0)} MB)，解析可能耗时数分钟，` +
+          `期间 UI 仍可点击但 CPU 会满载。\n\n建议：\n` +
+          `• CAD 中 PURGE 后导出（去除未引用块定义）\n` +
+          `• 只导出关键图层（建筑、柱网、设备）\n` +
+          `• 大于 200MB 的总图建议先在 CAD 中裁剪到子区域\n\n继续解析？`
+      );
+      if (!ok) {
+        e.target.value = "";
+        return;
+      }
+    }
     try {
       const parsed = await parseDxfFile(f, (p) => setDxfProgress(p));
       const summary =
@@ -89,6 +116,7 @@ export function Toolbar() {
   return (
     <>
       <DxfProgressOverlay progress={dxfProgress} />
+      {showBlockWizard && <BlockImportWizard onClose={() => setShowBlockWizard(false)} />}
     <div className="flex items-center gap-2 border-b border-slate-200 bg-white px-3 py-1.5">
       <div className="text-sm font-bold text-slate-800">ILP</div>
       <span className="text-slate-300">|</span>
@@ -120,8 +148,18 @@ export function Toolbar() {
         }} />
         <ToolBtn
           icon={<ImageIcon size={14} />}
-          label="导入 DXF"
+          label="导入 DXF 底图"
           onClick={() => dxfRef.current?.click()}
+        />
+        <ToolBtn
+          icon={<PackagePlus size={14} />}
+          label="抽取 DXF 图块"
+          onClick={() => setShowBlockWizard(true)}
+        />
+        <ToolBtn
+          icon={<Zap size={14} />}
+          label="批量瘦身"
+          onClick={() => setShowBatchSlim(true)}
         />
         <ToolBtn
           icon={<FolderOpen size={14} />}
@@ -154,6 +192,7 @@ export function Toolbar() {
         />
       </div>
     </div>
+    {showBatchSlim && <BatchSlimDialog onClose={() => setShowBatchSlim(false)} />}
     </>
   );
 }

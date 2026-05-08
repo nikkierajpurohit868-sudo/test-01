@@ -28,7 +28,7 @@ export function DxfBackgroundLayer({
   );
 }
 
-function EntityNode({ entity, color, scale }: { entity: DxfEntity; color: string; scale: number }) {
+export function EntityNode({ entity, color, scale }: { entity: DxfEntity; color: string; scale: number }) {
   const stroke = 1 / scale; // 屏幕 1px
   switch (entity.kind) {
     case "line":
