@@ -6,6 +6,7 @@ import { EquipmentLibraryPanel } from "@/panels/EquipmentLibraryPanel";
 import { DxfPanel } from "@/panels/DxfPanel";
 import { CustomBlockPanel } from "@/panels/CustomBlockPanel";
 import { PropertiesPanel } from "@/panels/PropertiesPanel";
+import { MotionPathInspector } from "@/panels/MotionPathInspector";
 import { MEListPanel } from "@/panels/MEListPanel";
 import { CTPanel } from "@/panels/CTPanel";
 import { Resizer, useResizable } from "@/components/Resizer";
@@ -163,7 +164,7 @@ function AppLayout({
             >
               <PanelHeader title="属性" onClose={() => setRightClosed(true)} />
               <div className="flex-1 min-h-0 overflow-y-auto">
-                <PropertiesPanel />
+                <RightPanelBody />
               </div>
             </div>
           </>
@@ -171,6 +172,13 @@ function AppLayout({
       </div>
     </div>
   );
+}
+
+/** 右侧面板内容：根据选中类型自动切换 (动线 vs 普通对象) */
+function RightPanelBody() {
+  const selectedPathId = useProjectStore((s) => s.selectedPathId);
+  if (selectedPathId) return <MotionPathInspector />;
+  return <PropertiesPanel />;
 }
 
 /** 面板顶部小标题栏 + 关闭按钮 */

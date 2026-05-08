@@ -4,10 +4,11 @@
  *  按用户需求覆盖：名称、数量、干涉、工时、费用、挂载关系、自定义属性。
  */
 import { useEffect, useMemo, useState } from "react";
-import { X, Plus, Trash2, Zap, RotateCcw } from "lucide-react";
+import { X, Plus, Trash2, Zap, RotateCcw, Eraser } from "lucide-react";
 import type { CustomBlock, CustomBlockCategory, MountType, UserAttr } from "@ilp/schema";
 import { useProjectStore } from "@/store/projectStore";
 import { statEntities, type SlimPreset } from "@/lib/slimBlock";
+import { BlockEraserCanvas } from "@/components/BlockEraserCanvas";
 
 const CATEGORY_LABEL: Record<CustomBlockCategory, string> = {
   robot: "机器人",
@@ -783,6 +784,7 @@ function SlimTab({ blockId }: { blockId: string }) {
   const [minSeg, setMinSeg] = useState(0);
   const [minR, setMinR] = useState(0);
   const [eps, setEps] = useState(0);
+  const [showEraser, setShowEraser] = useState(false);
 
   if (!block) return null;
 
@@ -853,9 +855,26 @@ function SlimTab({ blockId }: { blockId: string }) {
         )}
       </div>
 
+      {/* 交互式擦除入口 */}
+      <button
+        onClick={() => setShowEraser(true)}
+        className="flex w-full items-center justify-between rounded border border-sky-300 bg-gradient-to-r from-sky-50 to-indigo-50 p-3 text-left hover:border-sky-500 hover:from-sky-100"
+      >
+        <div className="flex items-center gap-2">
+          <Eraser size={18} className="text-sky-600" />
+          <div>
+            <div className="text-xs font-semibold text-slate-800">打开擦除画布（推荐）</div>
+            <div className="text-[10px] text-slate-500">
+              可视化橡皮擦 · 框选擦除 · 框选自动瘦身（区域 LOD），支持撤销/重置
+            </div>
+          </div>
+        </div>
+        <span className="text-sky-600">→</span>
+      </button>
+
       {/* 自动预设 */}
       <div>
-        <div className="mb-1 text-[11px] font-semibold text-slate-600">自动瘦身（一键预设）</div>
+        <div className="mb-1 text-[11px] font-semibold text-slate-600">自动瘦身（一键预设，全局）</div>
         <div className="grid grid-cols-4 gap-2">
           {(Object.keys(PRESET_LABELS) as SlimPreset[]).map((p) => (
             <button
@@ -981,6 +1000,10 @@ function SlimTab({ blockId }: { blockId: string }) {
           <RotateCcw size={12} /> 还原
         </button>
       </div>
+
+      {showEraser && (
+        <BlockEraserCanvas blockId={blockId} onClose={() => setShowEraser(false)} />
+      )}
     </div>
   );
 }

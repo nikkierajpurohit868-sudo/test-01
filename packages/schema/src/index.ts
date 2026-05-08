@@ -422,6 +422,104 @@ export const SlimOptions = z.object({
 });
 export type SlimOptions = z.infer<typeof SlimOptions>;
 
+/* ---------- 操作动线（标准工时） ---------- */
+
+/** 标准模式：UAS 速度档 / MTM-1 步数 TMU / 自定义速度 */
+export const MotionStandardMode = z.enum(["uas", "mtm1", "custom"]);
+export type MotionStandardMode = z.infer<typeof MotionStandardMode>;
+
+/** UAS 预设速度档 + cart */
+export const MotionType = z.enum([
+  "walk_unloaded", // 自由步行 1.40 m/s
+  "walk_uas_standard", // UAS 标准 1.10 m/s
+  "walk_light", // 轻载 1.00 m/s
+  "walk_medium", // 中载 0.85 m/s
+  "walk_heavy", // 重载 0.70 m/s
+  "cart", // 推车 1.20 m/s
+  "custom",
+]);
+export type MotionType = z.infer<typeof MotionType>;
+
+/** 端点/中段动作（MTM-1 节选标定） */
+export const MotionActionId = z.enum([
+  "pickup_small", // 拾起小件 R8B+G1A ~13 TMU
+  "place_small", // 放置小件 M8B+RL1 ~13 TMU
+  "turn_90", // 转身 90° 18.6 TMU
+  "stoop_pickup", // 弯腰拾起 29.0 TMU
+  "cart_start", // 推车启动 5.6 TMU
+]);
+export type MotionActionId = z.infer<typeof MotionActionId>;
+
+export const MotionAction = z.object({
+  /** 在路径中位置：start | end | 中段 waypoint 索引 */
+  at: z.union([z.literal("start"), z.literal("end"), z.number().int().nonnegative()]),
+  actionId: MotionActionId,
+});
+export type MotionAction = z.infer<typeof MotionAction>;
+
+export const Waypoint = z.object({
+  x: z.number(),
+  y: z.number(),
+  /** 吸附到画布对象时记录 refId；该对象移动时端点跟随 */
+  anchorItemId: z.string().optional(),
+  /** 相对该对象中心的偏移；保证旋转/位移后端点保持几何关系 */
+  anchorOffset: z.object({ dx: z.number(), dy: z.number() }).optional(),
+});
+export type Waypoint = z.infer<typeof Waypoint>;
+
+export const MotionDerived = z.object({
+  lengthMm: z.number().nonnegative(),
+  walkSec: z.number().nonnegative(),
+  actionsSec: z.number().nonnegative(),
+  totalSec: z.number().nonnegative(),
+  tmu: z.number().nonnegative().optional(),
+  steps: z.number().nonnegative().optional(),
+  breakdown: z
+    .array(
+      z.object({
+        label: z.string(),
+        sec: z.number(),
+        tmu: z.number().optional(),
+      })
+    )
+    .default([]),
+});
+export type MotionDerived = z.infer<typeof MotionDerived>;
+
+export const MotionPath = z.object({
+  id: z.string(),
+  name: z.string().default("动线"),
+  color: z.string().default("#0ea5e9"),
+  waypoints: z.array(Waypoint).min(2).default([
+    { x: 0, y: 0 },
+    { x: 1000, y: 0 },
+  ] as Waypoint[]),
+  motionType: MotionType.default("walk_uas_standard"),
+  standardMode: MotionStandardMode.default("uas"),
+  /** 自定义速度 (m/s)，仅 standardMode=custom 生效 */
+  customSpeed: z.number().positive().optional(),
+  /** PF&D 宽放（小数）；未设则用项目默认 */
+  customAllowance: z.number().min(0).max(1).optional(),
+  endpointActions: z.array(MotionAction).default([]),
+  /** 可选挂钩 */
+  operationId: z.string().optional(),
+  stationId: z.string().optional(),
+  /** 派生：保存时一并写入便于离线读取 */
+  derived: MotionDerived.optional(),
+  visible: z.boolean().default(true),
+  locked: z.boolean().default(false),
+});
+export type MotionPath = z.infer<typeof MotionPath>;
+
+/** 项目级默认值 */
+export const MotionDefaults = z.object({
+  standardMode: MotionStandardMode.default("uas"),
+  defaultMotionType: MotionType.default("walk_uas_standard"),
+  pfdAllowance: z.number().min(0).max(1).default(0.12),
+  stepLengthMm: z.number().positive().default(750),
+});
+export type MotionDefaults = z.infer<typeof MotionDefaults>;
+
 /* ---------- 项目（顶层聚合根） ---------- */
 
 export const ProjectMeta = z.object({
@@ -432,6 +530,8 @@ export const ProjectMeta = z.object({
   updatedAt: z.string(),
   /** 画布单位，固定 mm */
   unit: z.literal("mm").default("mm"),
+  /** 动线/标准工时全局默认 */
+  motionDefaults: MotionDefaults.default({}),
 });
 export type ProjectMeta = z.infer<typeof ProjectMeta>;
 
@@ -448,6 +548,8 @@ export const Project = z.object({
   dxfBackgrounds: z.array(DxfBackground).default([]),
   /** 用户从 DXF 抽取的自定义图块库（项目内可见） */
   customBlocks: z.array(CustomBlock).default([]),
+  /** 操作动线（标准工时） */
+  motionPaths: z.array(MotionPath).default([]),
 });
 export type Project = z.infer<typeof Project>;
 

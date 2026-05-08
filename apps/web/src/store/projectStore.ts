@@ -21,6 +21,8 @@ import {
   newProject,
 } from "@ilp/schema";
 import { slimEntities, presetOptions, type SlimPreset } from "@/lib/slimBlock";
+import { computeMotionTime } from "@/lib/motionTime";
+import type { DxfEntity, MotionPath, Waypoint } from "@ilp/schema";
 
 /** addCustomBlocks 接受的输入类型：复用 zod schema 的 input 类型（默认字段可省略） */
 export type CustomBlockInput = Omit<Parameters<typeof CustomBlockSchema.parse>[0], "id">;
@@ -89,6 +91,30 @@ interface ProjectStore {
     preset: SlimPreset,
     threshold: number
   ) => { affected: number; before: number; after: number };
+  /** 直接覆盖图块的 entities（橡皮擦/区域瘦身的统一提交点）；首次会备份 originalEntities */
+  applyBlockEntities: (id: string, entities: DxfEntity[]) => void;
+
+  // ------- 操作动线 -------
+  /** 当前选中的动线（与 selectedItemId 互斥） */
+  selectedPathId: string | null;
+  selectPath: (id: string | null) => void;
+  /** UI 工具状态：当前是否处于"绘制动线"模式 */
+  drawingMotionPath: { activeId: string | null } | null;
+  startDrawMotionPath: () => string;
+  finishDrawMotionPath: () => void;
+  cancelDrawMotionPath: () => void;
+
+  addMotionPath: (init?: Partial<Omit<MotionPath, "id">>) => string;
+  updateMotionPath: (id: string, patch: Partial<MotionPath>) => void;
+  deleteMotionPath: (id: string) => void;
+  appendWaypoint: (pathId: string, wp: Waypoint) => void;
+  moveWaypoint: (pathId: string, idx: number, wp: Partial<Waypoint>) => void;
+  removeWaypoint: (pathId: string, idx: number) => void;
+  insertWaypoint: (pathId: string, idx: number, wp: Waypoint) => void;
+  /** 重新计算指定路径的派生字段 */
+  recomputeMotionPath: (id: string) => void;
+  /** 重算所有路径（用于 anchor 移动 / 默认值变更） */
+  recomputeAllMotionPaths: () => void;
 }
 
 let saveTimer: number | undefined;
@@ -163,7 +189,18 @@ export const useProjectStore = create<ProjectStore>()((set, _get) => {
   updateCanvasItem: (id, patch) =>
     mutate((p) => {
       const it = p.canvasItems.find((i) => i.id === id);
-      if (it) Object.assign(it, patch);
+      if (!it) return;
+      Object.assign(it, patch);
+      // 若有动线 anchor 到此 item，则触发重算
+      const affected = p.motionPaths.filter((mp) =>
+        mp.waypoints.some((wp) => wp.anchorItemId === id)
+      );
+      for (const mp of affected) {
+        mp.derived = computeMotionTime(mp, {
+          defaults: p.meta.motionDefaults,
+          items: p.canvasItems,
+        });
+      }
     }),
 
   updateEquipment: (id, patch) =>
@@ -405,6 +442,21 @@ export const useProjectStore = create<ProjectStore>()((set, _get) => {
     return { affected, before, after };
   },
 
+  applyBlockEntities: (id, entities) =>
+    mutate((p) => {
+      const b = p.customBlocks.find((x) => x.id === id);
+      if (!b) return;
+      if (!b.originalEntities) b.originalEntities = b.entities.slice();
+      b.entities = entities;
+      b.slim = {
+        ...b.slim,
+        level: "custom",
+        lastBefore: b.originalEntities.length,
+        lastAfter: entities.length,
+        lastAt: new Date().toISOString(),
+      };
+    }),
+
   addCanvasItemFromCustomBlock: (block, x, y) => {
     const itemId = nanoid();
     mutate((p) => {
@@ -426,6 +478,179 @@ export const useProjectStore = create<ProjectStore>()((set, _get) => {
     });
     return itemId;
   },
+
+  /* ==================== 操作动线 ==================== */
+
+  selectedPathId: null,
+  selectPath: (id) => set({ selectedPathId: id, selectedItemId: id ? null : _get().selectedItemId }),
+
+  drawingMotionPath: null,
+
+  startDrawMotionPath: () => {
+    const id = nanoid();
+    mutate((p) => {
+      const mp: MotionPath = {
+        id,
+        name: `动线${p.motionPaths.length + 1}`,
+        color: "#0ea5e9",
+        // 起始两个占位点；用户首点后会被替换
+        waypoints: [
+          { x: 0, y: 0 },
+          { x: 0, y: 0 },
+        ],
+        motionType: p.meta.motionDefaults.defaultMotionType,
+        standardMode: p.meta.motionDefaults.standardMode,
+        endpointActions: [],
+        visible: true,
+        locked: false,
+      };
+      p.motionPaths.push(mp);
+    });
+    set({ drawingMotionPath: { activeId: id } });
+    return id;
+  },
+  finishDrawMotionPath: () =>
+    set((s) => {
+      const id = s.drawingMotionPath?.activeId;
+      if (!id) return { drawingMotionPath: null };
+      const next = produce(s.project, (p) => {
+        const mp = p.motionPaths.find((m) => m.id === id);
+        if (!mp) return;
+        // 如果只有不到 2 个 waypoint，删除这条空路径
+        if (mp.waypoints.length < 2) {
+          p.motionPaths = p.motionPaths.filter((m) => m.id !== id);
+          return;
+        }
+        mp.derived = computeMotionTime(mp, {
+          defaults: p.meta.motionDefaults,
+          items: p.canvasItems,
+        });
+      });
+      scheduleSave(next);
+      return { project: next, drawingMotionPath: null };
+    }),
+  cancelDrawMotionPath: () =>
+    set((s) => {
+      const id = s.drawingMotionPath?.activeId;
+      if (!id) return { drawingMotionPath: null };
+      const next = produce(s.project, (p) => {
+        p.motionPaths = p.motionPaths.filter((m) => m.id !== id);
+      });
+      scheduleSave(next);
+      return { project: next, drawingMotionPath: null };
+    }),
+
+  addMotionPath: (init = {}) => {
+    const id = nanoid();
+    mutate((p) => {
+      const mp: MotionPath = {
+        id,
+        name: init.name ?? `动线${p.motionPaths.length + 1}`,
+        color: init.color ?? "#0ea5e9",
+        waypoints: init.waypoints ?? [
+          { x: 0, y: 0 },
+          { x: 1000, y: 0 },
+        ],
+        motionType: init.motionType ?? p.meta.motionDefaults.defaultMotionType,
+        standardMode: init.standardMode ?? p.meta.motionDefaults.standardMode,
+        customSpeed: init.customSpeed,
+        customAllowance: init.customAllowance,
+        endpointActions: init.endpointActions ?? [],
+        operationId: init.operationId,
+        stationId: init.stationId,
+        visible: init.visible ?? true,
+        locked: init.locked ?? false,
+      };
+      mp.derived = computeMotionTime(mp, {
+        defaults: p.meta.motionDefaults,
+        items: p.canvasItems,
+      });
+      p.motionPaths.push(mp);
+    });
+    return id;
+  },
+
+  updateMotionPath: (id, patch) =>
+    mutate((p) => {
+      const mp = p.motionPaths.find((m) => m.id === id);
+      if (!mp) return;
+      Object.assign(mp, patch);
+      mp.derived = computeMotionTime(mp, {
+        defaults: p.meta.motionDefaults,
+        items: p.canvasItems,
+      });
+    }),
+
+  deleteMotionPath: (id) =>
+    mutate((p) => {
+      p.motionPaths = p.motionPaths.filter((m) => m.id !== id);
+    }),
+
+  appendWaypoint: (pathId, wp) =>
+    mutate((p) => {
+      const mp = p.motionPaths.find((m) => m.id === pathId);
+      if (!mp) return;
+      mp.waypoints.push(wp);
+      mp.derived = computeMotionTime(mp, {
+        defaults: p.meta.motionDefaults,
+        items: p.canvasItems,
+      });
+    }),
+
+  moveWaypoint: (pathId, idx, wp) =>
+    mutate((p) => {
+      const mp = p.motionPaths.find((m) => m.id === pathId);
+      if (!mp) return;
+      const cur = mp.waypoints[idx];
+      if (!cur) return;
+      mp.waypoints[idx] = { ...cur, ...wp };
+      mp.derived = computeMotionTime(mp, {
+        defaults: p.meta.motionDefaults,
+        items: p.canvasItems,
+      });
+    }),
+
+  removeWaypoint: (pathId, idx) =>
+    mutate((p) => {
+      const mp = p.motionPaths.find((m) => m.id === pathId);
+      if (!mp || mp.waypoints.length <= 2) return; // 至少保留 2 点
+      mp.waypoints.splice(idx, 1);
+      mp.derived = computeMotionTime(mp, {
+        defaults: p.meta.motionDefaults,
+        items: p.canvasItems,
+      });
+    }),
+
+  insertWaypoint: (pathId, idx, wp) =>
+    mutate((p) => {
+      const mp = p.motionPaths.find((m) => m.id === pathId);
+      if (!mp) return;
+      mp.waypoints.splice(idx, 0, wp);
+      mp.derived = computeMotionTime(mp, {
+        defaults: p.meta.motionDefaults,
+        items: p.canvasItems,
+      });
+    }),
+
+  recomputeMotionPath: (id) =>
+    mutate((p) => {
+      const mp = p.motionPaths.find((m) => m.id === id);
+      if (!mp) return;
+      mp.derived = computeMotionTime(mp, {
+        defaults: p.meta.motionDefaults,
+        items: p.canvasItems,
+      });
+    }),
+
+  recomputeAllMotionPaths: () =>
+    mutate((p) => {
+      for (const mp of p.motionPaths) {
+        mp.derived = computeMotionTime(mp, {
+          defaults: p.meta.motionDefaults,
+          items: p.canvasItems,
+        });
+      }
+    }),
   });
 });
 

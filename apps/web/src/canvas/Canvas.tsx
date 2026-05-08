@@ -5,13 +5,14 @@
  *  - 网格 100mm 细线 / 1000mm 粗线
  *  - 拖入设备：监听原生 dragover/drop（Stage 容器）
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Stage, Layer, Rect, Line, Text, Group, Circle, Transformer } from "react-konva";
 import type Konva from "konva";
 import { useProjectStore } from "@/store/projectStore";
 import { findTemplate } from "@/lib/equipmentLibrary";
-import type { CanvasItem, CustomBlock } from "@ilp/schema";
+import type { CanvasItem, CustomBlock, Waypoint } from "@ilp/schema";
 import { DxfBackgroundLayer, EntityNode } from "./DxfBackgroundLayer";
+import { MotionPathLayer } from "./MotionPathLayer";
 
 const MIN_SCALE = 0.005;
 const MAX_SCALE = 1;
@@ -37,6 +38,82 @@ export function Canvas() {
   const trRef = useRef<Konva.Transformer>(null);
   const itemNodeRefs = useRef(new Map<string, Konva.Group>());
 
+  /* ========== 动线相关 ========== */
+  const motionPaths = useProjectStore((s) => s.project.motionPaths);
+  const drawing = useProjectStore((s) => s.drawingMotionPath);
+  const startDraw = useProjectStore((s) => s.startDrawMotionPath);
+  const finishDraw = useProjectStore((s) => s.finishDrawMotionPath);
+  const cancelDraw = useProjectStore((s) => s.cancelDrawMotionPath);
+  const appendWaypoint = useProjectStore((s) => s.appendWaypoint);
+  const moveWaypoint = useProjectStore((s) => s.moveWaypoint);
+  const insertWaypoint = useProjectStore((s) => s.insertWaypoint);
+  const removeWaypoint = useProjectStore((s) => s.removeWaypoint);
+  const updateMotionPath = useProjectStore((s) => s.updateMotionPath);
+  const selectedPathId = useProjectStore((s) => s.selectedPathId);
+  const selectPath = useProjectStore((s) => s.selectPath);
+
+  /** 鼠标在世界坐标的当前位置（mm），用于橡皮筋 */
+  type HoverState = { x: number; y: number; snappedItemId?: string } | null;
+  const [hover, setHover] = useState<HoverState>(null);
+  /** 用于 mousemove 节流：rAF 内才提交到 React 状态 */
+  const pendingHover = useRef<HoverState>(null);
+  const hoverRaf = useRef<number | null>(null);
+  const scheduleHover = (next: HoverState) => {
+    pendingHover.current = next;
+    if (hoverRaf.current != null) return;
+    hoverRaf.current = requestAnimationFrame(() => {
+      hoverRaf.current = null;
+      setHover(pendingHover.current);
+    });
+  };
+  useEffect(
+    () => () => {
+      if (hoverRaf.current != null) cancelAnimationFrame(hoverRaf.current);
+    },
+    []
+  );
+
+  /** 绘制模式已点击次数（reset 时清零） */
+  const drawClickCount = useRef(0);
+  useEffect(() => {
+    if (!drawing) {
+      drawClickCount.current = 0;
+      setHover(null);
+    }
+  }, [drawing?.activeId]);
+
+  /** 屏幕点 → 世界 mm */
+  const toWorld = (px: number, py: number) => ({
+    x: (px - view.x) / view.scale,
+    y: (py - view.y) / view.scale,
+  });
+
+  /**
+   * 找当前点对应的吸附目标：
+   *  1) 优先：(wx,wy) 在某 item 的 bbox 内 → 选中该 item
+   *  2) 否则：屏幕距离 < 30px 的最近 item
+   */
+  const findSnapItem = (wx: number, wy: number): { id: string; cx: number; cy: number } | null => {
+    for (const it of items) {
+      if (!it.visible) continue;
+      if (wx >= it.x && wx <= it.x + it.w && wy >= it.y && wy <= it.y + it.h) {
+        return { id: it.id, cx: it.x + it.w / 2, cy: it.y + it.h / 2 };
+      }
+    }
+    const SNAP_PX = 30;
+    let best: { id: string; cx: number; cy: number; d: number } | null = null;
+    for (const it of items) {
+      if (!it.visible) continue;
+      const cx = it.x + it.w / 2;
+      const cy = it.y + it.h / 2;
+      const dPx = Math.hypot(cx - wx, cy - wy) * view.scale;
+      if (dPx <= SNAP_PX && (!best || dPx < best.d)) {
+        best = { id: it.id, cx, cy, d: dPx };
+      }
+    }
+    return best ? { id: best.id, cx: best.cx, cy: best.cy } : null;
+  };
+
   // resize observe
   useEffect(() => {
     if (!containerRef.current) return;
@@ -49,18 +126,29 @@ export function Canvas() {
     return () => ro.disconnect();
   }, []);
 
-  // delete key
+  // delete key + esc/enter 配合动线绘制
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if ((e.key === "Delete" || e.key === "Backspace") && selectedItemId) {
-        const target = e.target as HTMLElement;
-        if (target?.tagName === "INPUT" || target?.tagName === "TEXTAREA") return;
-        deleteCanvasItem(selectedItemId);
+      const target = e.target as HTMLElement;
+      const inEditor = target?.tagName === "INPUT" || target?.tagName === "TEXTAREA";
+      if (drawing) {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          cancelDraw();
+        } else if (e.key === "Enter") {
+          e.preventDefault();
+          finishDraw();
+        }
+        return;
+      }
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (inEditor) return;
+        if (selectedItemId) deleteCanvasItem(selectedItemId);
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [selectedItemId, deleteCanvasItem]);
+  }, [selectedItemId, deleteCanvasItem, drawing, cancelDraw, finishDraw]);
 
   // wheel zoom
   const onWheel = (e: Konva.KonvaEventObject<WheelEvent>) => {
@@ -156,16 +244,93 @@ export function Canvas() {
         y={view.y}
         scaleX={view.scale}
         scaleY={view.scale}
-        draggable
+        draggable={!drawing}
         onWheel={onWheel}
         onDragMove={onDragMoveStage}
+        onMouseMove={(e) => {
+          if (!drawing) return;
+          const stage = e.target.getStage();
+          const p = stage?.getPointerPosition();
+          if (!p) return;
+          const w = toWorld(p.x, p.y);
+          const snapHit = findSnapItem(w.x, w.y);
+          scheduleHover(
+            snapHit
+              ? { x: snapHit.cx, y: snapHit.cy, snappedItemId: snapHit.id }
+              : { x: snap(w.x), y: snap(w.y) }
+          );
+        }}
         onMouseDown={(e) => {
-          if (e.target === e.target.getStage()) selectItem(null);
+          if (drawing) {
+            const stage = e.target.getStage();
+            const p = stage?.getPointerPosition();
+            if (!p) return;
+            const w = toWorld(p.x, p.y);
+            const snapHit = findSnapItem(w.x, w.y);
+            const activeId = drawing.activeId!;
+            const n = drawClickCount.current;
+
+            // 起点：必须命中对象（设备/操作者/料箱）
+            if (n === 0) {
+              if (!snapHit) return; // 静默忽略；提示条已说明
+              moveWaypoint(activeId, 0, {
+                x: snapHit.cx,
+                y: snapHit.cy,
+                anchorItemId: snapHit.id,
+                anchorOffset: { dx: 0, dy: 0 },
+              });
+              drawClickCount.current = 1;
+              e.cancelBubble = true;
+              return;
+            }
+
+            // 命中对象 → 终点；与起点是同一对象时静默忽略（除非已经画了拐点）
+            if (snapHit) {
+              const path = motionPaths.find((m) => m.id === activeId);
+              const startId = path?.waypoints[0]?.anchorItemId;
+              const onlyStartFilled = (path?.waypoints.length ?? 0) <= 2 && n === 1;
+              if (startId && snapHit.id === startId && onlyStartFilled) return;
+              const wp: Waypoint = {
+                x: snapHit.cx,
+                y: snapHit.cy,
+                anchorItemId: snapHit.id,
+                anchorOffset: { dx: 0, dy: 0 },
+              };
+              if (n === 1) moveWaypoint(activeId, 1, wp);
+              else appendWaypoint(activeId, wp);
+              drawClickCount.current = n + 1;
+              finishDraw();
+              e.cancelBubble = true;
+              return;
+            }
+
+            // 空白 → 中间拐点（仅当点击在 stage 上）
+            if (e.target !== e.target.getStage()) return;
+            const wp: Waypoint = { x: snap(w.x), y: snap(w.y) };
+            if (n === 1) moveWaypoint(activeId, 1, wp);
+            else appendWaypoint(activeId, wp);
+            drawClickCount.current = n + 1;
+            return;
+          }
+          if (e.target === e.target.getStage()) {
+            selectItem(null);
+            selectPath(null);
+          }
+        }}
+        onDblClick={(e) => {
+          if (drawing) {
+            // 双击结束（有效 waypoint >= 2）
+            const id = drawing.activeId;
+            const path = id ? motionPaths.find((m) => m.id === id) : null;
+            if (path && path.waypoints.length >= 2) finishDraw();
+            else cancelDraw();
+            e.evt.preventDefault();
+          }
         }}
       >
         <GridLayer view={view} stageSize={size} />
         <DxfBackgroundLayer backgrounds={dxfBackgrounds} scale={view.scale} />
-        <Layer>
+        <Layer listening={!drawing}>
           {items.map((it) => (
             <CanvasItemNode
               key={it.id}
@@ -211,11 +376,57 @@ export function Canvas() {
             anchorFill="#fff"
           />
         </Layer>
+        {/* 绘制模式：高亮所有可吸附对象（静态蓝框 + 动态绿框分层） */}
+        {drawing && (
+          <Layer listening={false}>
+            <SnapTargetsStatic items={items} scale={view.scale} />
+            {hover?.snappedItemId &&
+              (() => {
+                const it = items.find((i) => i.id === hover.snappedItemId);
+                if (!it) return null;
+                const pad = 30 / view.scale;
+                return (
+                  <Rect
+                    x={it.x - pad}
+                    y={it.y - pad}
+                    width={it.w + pad * 2}
+                    height={it.h + pad * 2}
+                    fill="rgba(16,185,129,0.18)"
+                    stroke="#10b981"
+                    strokeWidth={3 / view.scale}
+                    cornerRadius={6 / view.scale}
+                  />
+                );
+              })()}
+          </Layer>
+        )}
+        <MotionPathLayer
+          paths={motionPaths}
+          items={items}
+          scale={view.scale}
+          selectedPathId={selectedPathId}
+          drawingPathId={drawing?.activeId ?? null}
+          rubberEnd={drawing && drawClickCount.current >= 1 ? hover : null}
+          onSelectPath={(id) => {
+            selectItem(null);
+            selectPath(id);
+          }}
+          onMoveWaypoint={(pid, idx, wp) => moveWaypoint(pid, idx, wp)}
+          onInsertWaypointBetween={(pid, idx, wp) => insertWaypoint(pid, idx, wp)}
+          onRemoveWaypoint={(pid, idx) => removeWaypoint(pid, idx)}
+        />
       </Stage>
 
       <div className="pointer-events-none absolute bottom-2 left-2 rounded bg-slate-900/70 px-2 py-1 text-xs text-white">
         {(view.scale * 1000).toFixed(1)} px/m · 拖入设备库 / 滚轮缩放 / 拖拽平移 / Del 删除
       </div>
+
+      {/* 绘制动线提示条 */}
+      {drawing && (() => {
+        const activePath = motionPaths.find((m) => m.id === drawing.activeId);
+        const startPicked = !!activePath?.waypoints[0]?.anchorItemId;
+        return <DrawingHint startPicked={startPicked} onCancel={cancelDraw} />;
+      })()}
       <div className="absolute bottom-2 right-2 flex gap-1">
         <button
           className="rounded bg-white/90 px-2 py-1 text-xs text-slate-700 shadow ring-1 ring-slate-200 hover:bg-white"
@@ -269,7 +480,7 @@ function fitToContent(
   });
 }
 
-function CanvasItemNode(props: {
+interface CanvasItemNodeProps {
   item: CanvasItem;
   customBlock?: CustomBlock;
   viewScale: number;
@@ -280,7 +491,19 @@ function CanvasItemNode(props: {
   onDragEnd: (x: number, y: number) => void;
   onTransformEnd: (x: number, y: number, rotation: number) => void;
   registerRef: (node: Konva.Group | null) => void;
-}) {
+}
+const CanvasItemNode = memo(
+  CanvasItemNodeImpl,
+  // 自定义浅比较：忽略回调 ref 变化（回调内部都基于 store API + item.id，逻辑稳定）
+  (prev, next) =>
+    prev.item === next.item &&
+    prev.customBlock === next.customBlock &&
+    prev.viewScale === next.viewScale &&
+    prev.eqColor === next.eqColor &&
+    prev.reach === next.reach &&
+    prev.selected === next.selected
+);
+function CanvasItemNodeImpl(props: CanvasItemNodeProps) {
   const {
     item,
     customBlock,
@@ -362,6 +585,70 @@ function CanvasItemNode(props: {
         align="center"
       />
     </Group>
+  );
+}
+
+/** 可吸附目标的静态蓝色提示框；items/scale 不变时不重渲 */
+const SnapTargetsStatic = memo(function SnapTargetsStatic({
+  items,
+  scale,
+}: {
+  items: CanvasItem[];
+  scale: number;
+}) {
+  const pad = 30 / scale;
+  const dash = [10 / scale, 8 / scale];
+  const sw = 1.5 / scale;
+  const cr = 6 / scale;
+  return (
+    <>
+      {items
+        .filter((it) => it.visible)
+        .map((it) => (
+          <Rect
+            key={it.id}
+            x={it.x - pad}
+            y={it.y - pad}
+            width={it.w + pad * 2}
+            height={it.h + pad * 2}
+            fill="rgba(14,165,233,0.06)"
+            stroke="#0ea5e9"
+            strokeWidth={sw}
+            dash={dash}
+            cornerRadius={cr}
+          />
+        ))}
+    </>
+  );
+});
+
+/** 绘制动线的提示条；文案随阶段切换 */
+function DrawingHint({
+  startPicked,
+  onCancel,
+}: {
+  startPicked: boolean;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="absolute left-1/2 top-2 -translate-x-1/2 rounded-md bg-sky-600 px-3 py-1.5 text-xs text-white shadow-lg">
+      {!startPicked ? (
+        <>
+          <b>选择起点对象</b>：点击设备 / 操作者 / 料箱（蓝框为可选目标，hover 时变绿）
+        </>
+      ) : (
+        <>
+          <b>选择终点对象</b>，或在空白处点击添加拐点 ·{" "}
+          <kbd className="rounded bg-white/20 px-1">Esc</kbd> 取消
+        </>
+      )}
+      <button
+        onClick={onCancel}
+        className="ml-3 rounded bg-rose-500 px-2 py-0.5 hover:bg-rose-400"
+      >
+        取消
+      </button>
+    </div>
   );
 }
 

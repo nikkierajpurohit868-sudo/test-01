@@ -7,6 +7,7 @@ import {
   Magnet,
   PackagePlus,
   Zap,
+  Route,
 } from "lucide-react";
 import { useRef, useState } from "react";
 import { useProjectStore } from "@/store/projectStore";
@@ -161,6 +162,7 @@ export function Toolbar() {
           label="批量瘦身"
           onClick={() => setShowBatchSlim(true)}
         />
+        <DrawMotionPathBtn />
         <ToolBtn
           icon={<FolderOpen size={14} />}
           label="导入项目"
@@ -201,18 +203,45 @@ function ToolBtn({
   icon,
   label,
   onClick,
+  active,
 }: {
   icon: React.ReactNode;
   label: string;
   onClick: () => void;
+  active?: boolean;
 }) {
   return (
     <button
       onClick={onClick}
-      className="flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700 hover:border-slate-400 hover:bg-slate-50"
+      className={
+        "flex items-center gap-1 rounded border px-2 py-1 text-xs " +
+        (active
+          ? "border-sky-500 bg-sky-100 text-sky-800"
+          : "border-slate-200 bg-white text-slate-700 hover:border-slate-400 hover:bg-slate-50")
+      }
     >
       {icon}
       <span>{label}</span>
     </button>
+  );
+}
+
+function DrawMotionPathBtn() {
+  const drawing = useProjectStore((s) => s.drawingMotionPath);
+  const start = useProjectStore((s) => s.startDrawMotionPath);
+  const cancel = useProjectStore((s) => s.cancelDrawMotionPath);
+  const finish = useProjectStore((s) => s.finishDrawMotionPath);
+  return (
+    <ToolBtn
+      icon={<Route size={14} />}
+      label={drawing ? "结束绘制" : "绘制动线"}
+      active={!!drawing}
+      onClick={() => {
+        if (drawing) finish();
+        else {
+          start();
+        }
+      }}
+    />
   );
 }
